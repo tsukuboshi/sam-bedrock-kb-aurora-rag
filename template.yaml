@@ -1,0 +1,396 @@
+Transform: AWS::Serverless-2016-10-31
+Description: 'Knowledge Base for Amazon Bedrock with Aurora PostgreSQL (including db setup)'
+
+Mappings:
+  DatabaseMap:
+    DatabaseName:
+      Name: bedrockkbdb
+    TableName:
+      Name: bedrock_integration.bedrock_kb
+    SchemaName:
+      Name: bedrock_integration
+    Username:
+      Name: bedrock_user
+    PrimaryKeyField:
+      Name: id
+    VectorField:
+      Name: embedding
+    TextField:
+      Name: chunks
+    MetadataField:
+      Name: metadata
+
+Parameters:
+  AuroraSchedulerState:
+    Type: String
+    Default: DISABLED
+    AllowedValues:
+      - DISABLED
+      - ENABLED
+    Description: 'Whether to enable the scheduler to start and stop the Aurora cluster.'
+  DatabasePassword:
+    Type: String
+    Default: 'P@ssword123'
+    Description: 'The password for the database user.'
+    NoEcho: true
+  EmbeddingModelId:
+    Type: String
+    Default: cohere.embed-multilingual-v3
+    AllowedValues:
+      - amazon.titan-embed-text-v1
+      - cohere.embed-multilingual-v3
+      - cohere.embed-english-v3
+    Description: 'The Id of the Bedrock model that is used to generate embeddings.'
+
+Conditions:
+  IsTitanEmbedTextV1: !Equals [!Ref EmbeddingModelId, "amazon.titan-embed-text-v1"]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 192.168.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub ${AWS::Region}a
+      CidrBlock: 192.168.0.0/28
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-subnet-1a
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Sub ${AWS::Region}c
+      CidrBlock: 192.168.0.16/28
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-subnet-1c
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-subnet-rtb
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Bedrock RDS Subnet Group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      DatabaseName: !FindInMap [DatabaseMap, DatabaseName, Name]
+      Engine: aurora-postgresql
+      EngineVersion: 15.5
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      MasterUsername: postgresql
+      ManageMasterUserPassword: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 1.0
+      StorageEncrypted: true
+      EnableHttpEndpoint: true
+  AuroraDBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref AuroraCluster
+  SecretForAurora:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}-db-secret-for-bedrock
+      Description: 'Secret for the database user for Bedrock'
+      SecretString: !Sub
+        - '{ "username":"${DatabaseUser}", "password":"${DatabasePassword}"}'
+        - DatabaseUser: !FindInMap [DatabaseMap, Username, Name]
+  DataSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-ds-bucket-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+  BedrockAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-bedrock-access-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'bedrock:InvokeModel'
+            Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}
+      Roles:
+        - !Ref BedrockKnowledgeBaseRole
+  SecretsAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-secret-access-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'secretsmanager:GetSecretValue'
+            Resource: !Ref SecretForAurora
+      Roles:
+        - !Ref BedrockKnowledgeBaseRole
+  AuroraAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-aurora-access-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'rds:DescribeDBClusters'
+              - 'rds-data:BatchExecuteStatement'
+              - 'rds-data:ExecuteStatement'
+            Resource: !GetAtt AuroraCluster.DBClusterArn
+          - Effect: Allow
+            Action:
+              - 'secretsmanager:GetSecretValue'
+            Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Roles:
+        - !Ref BedrockKnowledgeBaseRole
+        - !Ref ExecSQLFunctionRole
+  S3AccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-s3-access-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ListBucketStatement
+            Effect: Allow
+            Action:
+              - 's3:ListBucket'
+            Resource: !GetAtt DataSourceBucket.Arn
+            Condition:
+              StringEquals:
+                aws:ResourceAccount: !Ref 'AWS::AccountId'
+          - Sid: S3GetObjectStatement
+            Effect: Allow
+            Action:
+              - 's3:GetObject'
+            Resource: !Sub
+              - '${DataSourceBucketArn}/*'
+              - DataSourceBucketArn: !GetAtt DataSourceBucket.Arn
+            Condition:
+              StringEquals:
+                aws:ResourceAccount: !Ref 'AWS::AccountId'
+      Roles:
+        - !Ref BedrockKnowledgeBaseRole
+
+  SetupAuroraData:
+    Type: 'Custom::SetupAuroraData'
+    Properties:
+      ServiceToken: !GetAtt ExecSQLFunction.Arn
+      Dimension: !If [IsTitanEmbedTextV1, 1536, 1024]
+      ResourceArn: !GetAtt AuroraCluster.DBClusterArn
+      SecretArn: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      DatabaseName: !FindInMap [DatabaseMap, DatabaseName, Name]
+      DatabasePassword: !Ref DatabasePassword
+      TableName: !FindInMap [DatabaseMap, TableName, Name]
+      SchemaName: !FindInMap [DatabaseMap, SchemaName, Name]
+      UserName: !FindInMap [DatabaseMap, Username, Name]
+      MetadataField: !FindInMap [DatabaseMap, MetadataField, Name]
+      PrimaryKeyField: !FindInMap [DatabaseMap, PrimaryKeyField, Name]
+      TextField: !FindInMap [DatabaseMap, TextField, Name]
+      VectorField: !FindInMap [DatabaseMap, VectorField, Name]
+    DependsOn: AuroraDBInstance
+
+  ExecSQLFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-execsql-function-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ExecSQLFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-execsql-function
+      Handler: index.lambda_handler
+      Role: !GetAtt ExecSQLFunctionRole.Arn
+      Runtime: python3.12
+      Timeout: 600
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+      Layers:
+        - !Ref OSSLayer
+      CodeUri: ./function
+
+  OSSLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-oss'
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.12
+    Metadata:
+      BuildMethod: python3.12
+  BedrockKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-bedrock-kb-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [bedrock.amazonaws.com]
+            Action: ['sts:AssumeRole']
+  BedrockKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub ${AWS::StackName}-knowledge-base
+      KnowledgeBaseConfiguration:
+          Type: VECTOR
+          VectorKnowledgeBaseConfiguration:
+              EmbeddingModelArn: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}
+      RoleArn: !GetAtt BedrockKnowledgeBaseRole.Arn
+      StorageConfiguration:
+        Type: RDS
+        RdsConfiguration:
+          CredentialsSecretArn: !Ref SecretForAurora
+          DatabaseName: !FindInMap [DatabaseMap, DatabaseName, Name]
+          FieldMapping:
+            MetadataField: !FindInMap [DatabaseMap, MetadataField, Name]
+            PrimaryKeyField: !FindInMap [DatabaseMap, PrimaryKeyField, Name]
+            TextField: !FindInMap [DatabaseMap, TextField, Name]
+            VectorField: !FindInMap [DatabaseMap, VectorField, Name]
+          ResourceArn: !GetAtt AuroraCluster.DBClusterArn
+          TableName: !FindInMap [DatabaseMap, TableName, Name]
+    DependsOn: SetupAuroraData
+  BedrockKnowledgeBaseDS:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      DataDeletionPolicy: RETAIN
+      KnowledgeBaseId: !Ref BedrockKnowledgeBase
+      Name: !Sub ${AWS::StackName}-data-source
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt DataSourceBucket.Arn
+
+  SchedulerAuroraRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - scheduler.amazonaws.com
+          Action:
+          - sts:AssumeRole
+
+  SchedulerAuroraPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-scheduler-aurora-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - rds:StartDBCluster
+              - rds:StopDBCluster
+            Resource: !GetAtt AuroraCluster.DBClusterArn
+      Roles:
+        - !Ref SchedulerAuroraRole
+
+  ScheduleAuroraSart:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${StackName}-start-aurora
+      Description: Start Aurora Cluster
+      ScheduleExpression: cron(0 8 * * ? *)
+      ScheduleExpressionTimezone: Japan
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: !Ref AuroraSchedulerState
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:rds:startDBCluster
+        Input: !Sub |-
+          {
+            "DbClusterIdentifier": "${AuroraCluster}"
+          }
+        RoleArn: !GetAtt SchedulerAuroraRole.Arn
+
+  ScheduleAuroraStop:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${StackName}-stop-aurora
+      Description: Stop Aurora Cluster
+      ScheduleExpression: cron(0 20 * * ? *)
+      ScheduleExpressionTimezone: Japan
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: !Ref AuroraSchedulerState
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:rds:stopDBCluster
+        Input: !Sub |-
+          {
+            "DbClusterIdentifier": "${AuroraCluster}"
+          }
+        RoleArn: !GetAtt SchedulerAuroraRole.Arn
+
+Outputs:
+  BedrockKnowledgeBaseId:
+    Value: !Ref BedrockKnowledgeBase
+  BedrockDataSourceId:
+    Value: !Ref BedrockKnowledgeBaseDS
+  AuroraClusterId:
+    Value: !Ref AuroraCluster
+  DSBucketName:
+    Value: !Ref DataSourceBucket
